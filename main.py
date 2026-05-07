@@ -1,11 +1,9 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import os
 import anthropic
-import hashlib
-import hmac
 import json
 from datetime import datetime
 
@@ -19,21 +17,28 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# Usage limits per plan
+# ---------------------------------------------------------------------------
+
+PLAN_LIMITS = {
+    "pro": 50,
+    "agency": 200,
+}
+
+# In-memory usage counter for MVP.
+# Format: {"va_xxxx": {"count": 12, "month": "2026-05"}}
+# Resets automatically when the month changes.
+_usage: dict = {}
+
+
+# ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 
 class Signal(BaseModel):
-    model_config = {"populate_by_name": True}
-
     label: str
-    pass_: bool = False
+    passing: bool = False
     tip: str
-
-    @classmethod
-    def model_validate(cls, obj, *args, **kwargs):
-        if isinstance(obj, dict) and "pass" in obj:
-            obj = {**obj, "pass_": obj.pop("pass")}
-        return super().model_validate(obj, *args, **kwargs)
 
 
 class AnalyzeRequest(BaseModel):
@@ -53,23 +58,53 @@ class LicenseValidateRequest(BaseModel):
 # License helpers
 # ---------------------------------------------------------------------------
 
-VALID_LICENSES: dict = {}  # In-memory store for MVP — replace with Postgres in Phase 2
-
-
-def validate_license(license_key: str) -> dict:
-    """
-    MVP: license keys are stored in the VALID_LICENSES env var as JSON.
-    Format: {"va_xxxx": {"plan": "pro", "email": "user@example.com"}}
-    """
+def get_licenses() -> dict:
     licenses_json = os.environ.get("VALID_LICENSES", "{}")
     try:
-        licenses = json.loads(licenses_json)
+        return json.loads(licenses_json)
     except json.JSONDecodeError:
-        licenses = {}
+        return {}
 
-    if license_key in licenses:
-        return licenses[license_key]
-    return None
+
+def validate_license(license_key: str) -> dict | None:
+    licenses = get_licenses()
+    return licenses.get(license_key)
+
+
+def get_usage(license_key: str) -> dict:
+    current_month = datetime.utcnow().strftime("%Y-%m")
+    entry = _usage.get(license_key)
+    if not entry or entry.get("month") != current_month:
+        return {"count": 0, "month": current_month}
+    return entry
+
+
+def increment_usage(license_key: str) -> int:
+    current_month = datetime.utcnow().strftime("%Y-%m")
+    entry = get_usage(license_key)
+    entry["count"] += 1
+    entry["month"] = current_month
+    _usage[license_key] = entry
+    return entry["count"]
+
+
+def check_usage_limit(license_key: str, plan: str) -> tuple[int, int]:
+    """Returns (current_count, limit). Raises 429 if over limit."""
+    limit = PLAN_LIMITS.get(plan, 50)
+    usage = get_usage(license_key)
+    count = usage["count"]
+    if count >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "monthly_limit_reached",
+                "message": f"You've used all {limit} AI analyses for this month. Resets on the 1st.",
+                "used": count,
+                "limit": limit,
+                "plan": plan,
+            }
+        )
+    return count, limit
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +119,15 @@ Always respond with valid JSON matching the schema provided."""
 
 
 def build_analyze_prompt(content: str, signals: list[Signal], post_url: str = None, gsc_queries: list[str] = None) -> str:
-    failing = [s for s in signals if not s.pass_]
+    failing = [s for s in signals if not s.passing]
+    if not failing:
+        return None
+
     signal_list = "\n".join([f"- {s.label}: {s.tip}" for s in failing])
 
     gsc_section = ""
     if gsc_queries:
-        gsc_section = f"\nTop search queries this post ranks for:\n" + "\n".join([f"- {q}" for q in gsc_queries[:10]])
+        gsc_section = "\nTop search queries this post ranks for:\n" + "\n".join([f"- {q}" for q in gsc_queries[:10]])
 
     url_line = f"\nPost URL: {post_url}" if post_url else ""
 
@@ -126,11 +164,20 @@ def license_validate(req: LicenseValidateRequest):
     if not license_data:
         raise HTTPException(status_code=401, detail="Invalid license key")
 
+    plan = license_data.get("plan", "pro")
+    usage = get_usage(req.license_key)
+    limit = PLAN_LIMITS.get(plan, 50)
+
     return {
         "valid": True,
-        "plan": license_data.get("plan", "pro"),
+        "plan": plan,
         "email": license_data.get("email", ""),
-        "sites_allowed": 1 if license_data.get("plan") == "pro" else 10,
+        "sites_allowed": 1 if plan == "pro" else 10,
+        "usage": {
+            "used": usage["count"],
+            "limit": limit,
+            "resets": f"{datetime.utcnow().strftime('%Y-%m')}-01",
+        }
     }
 
 
@@ -141,20 +188,31 @@ def analyze(req: AnalyzeRequest):
     if not license_data:
         raise HTTPException(status_code=401, detail="Invalid license key")
 
+    plan = license_data.get("plan", "pro")
+
+    # Check monthly usage limit
+    used, limit = check_usage_limit(req.license_key, plan)
+
     # Check Claude API key
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     if not anthropic_key:
         raise HTTPException(status_code=500, detail="AI service not configured")
 
     # Only analyze failing signals
-    failing = [s for s in req.signals if not s.pass_]
+    failing = [s for s in req.signals if not s.passing]
     if not failing:
-        return {"suggestions": [], "message": "All signals are passing — nothing to improve!"}
+        return {
+            "suggestions": [],
+            "message": "All signals are passing — nothing to improve!",
+            "usage": {"used": used, "limit": limit},
+        }
+
+    # Build prompt
+    prompt = build_analyze_prompt(req.content, req.signals, req.post_url, req.gsc_queries)
 
     # Call Claude
     try:
         client = anthropic.Anthropic(api_key=anthropic_key)
-        prompt = build_analyze_prompt(req.content, req.signals, req.post_url, req.gsc_queries)
 
         message = client.messages.create(
             model="claude-opus-4-5",
@@ -165,14 +223,18 @@ def analyze(req: AnalyzeRequest):
 
         response_text = message.content[0].text
 
-        # Parse JSON from response
-        # Claude may wrap in markdown code blocks
+        # Strip markdown code fences if present
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0].strip()
         elif "```" in response_text:
             response_text = response_text.split("```")[1].split("```")[0].strip()
 
         result = json.loads(response_text)
+
+        # Increment usage only after successful Claude call
+        new_count = increment_usage(req.license_key)
+
+        result["usage"] = {"used": new_count, "limit": limit}
         return result
 
     except json.JSONDecodeError as e:
