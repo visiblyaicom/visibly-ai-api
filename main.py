@@ -113,9 +113,27 @@ def check_usage_limit(license_key: str, plan: str) -> tuple[int, int]:
 
 ANALYZE_SYSTEM_PROMPT = """You are an expert in AEO (Answer Engine Optimization) — optimizing content to be cited by AI answer engines like ChatGPT, Perplexity, and Google AI Overviews.
 
-You analyze WordPress posts and provide specific, copy-pasteable improvements for each failing signal. Be concrete, not generic. The user needs text they can paste directly into their post.
+You analyze WordPress posts and provide specific, copy-pasteable improvements for each failing signal. Be concrete, not generic.
+
+CRITICAL FORMATTING RULES for the "suggestion" field:
+- Return PLAIN TEXT or simple HTML only (e.g. <h2>, <p>, <strong>)
+- NEVER include WordPress block editor comments like <!-- wp:heading --> or <!-- wp:paragraph -->
+- The user will paste your suggestion into the WordPress visual editor — write it as human-readable text
+- For headings: write just the heading text (e.g. "What Is AI Analysis?") or "<h2>What Is AI Analysis?</h2>"
+- For paragraphs: write just the paragraph text
+- For FAQ schema: write plain Q&A pairs, not JSON-LD markup
 
 Always respond with valid JSON matching the schema provided."""
+
+
+def strip_block_comments(content: str) -> str:
+    """Remove Gutenberg block editor comments from post content, leaving clean HTML."""
+    import re
+    # Remove <!-- wp:xxx {...} --> and <!-- /wp:xxx --> style comments
+    clean = re.sub(r'<!--\s*/?wp:[^\-]*?-->', '', content)
+    # Collapse extra blank lines
+    clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
+    return clean
 
 
 def build_analyze_prompt(content: str, signals: list[Signal], post_url: str = None, gsc_queries: list[str] = None) -> str:
@@ -131,6 +149,9 @@ def build_analyze_prompt(content: str, signals: list[Signal], post_url: str = No
 
     url_line = f"\nPost URL: {post_url}" if post_url else ""
 
+    # Strip block editor markup so Claude sees clean HTML only
+    clean_content = strip_block_comments(content)
+
     return f"""Analyze this WordPress post and provide specific improvements for each failing signal.
 {url_line}
 
@@ -138,13 +159,13 @@ Failing signals:
 {signal_list}
 {gsc_section}
 
-Post content (HTML):
-{content[:8000]}
+Post content:
+{clean_content[:8000]}
 
 For each failing signal, return a JSON object with:
 - "signal": the signal label exactly as provided
-- "suggestion": specific text to add or change (copy-pasteable, ready to paste into the post)
-- "why": one sentence explaining why this improves AI citability or search ranking
+- "suggestion": plain text or simple HTML the user can copy-paste into their WordPress post (NO block editor markup)
+- "why": one sentence explaining why this improves AI citability
 
 Return a JSON object: {{"suggestions": [...]}}"""
 
