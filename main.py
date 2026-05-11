@@ -164,7 +164,7 @@ Post content:
 
 For each failing signal, return a JSON object with:
 - "signal": the signal label exactly as provided
-- "suggestion": plain text or simple HTML the user can copy-paste into their WordPress post (NO block editor markup)
+- "suggestion": plain text or simple HTML the user can copy-paste into their WordPress post (NO block editor markup). For FAQ signals, format as separate lines: "Q: ...\nA: ...\n\nQ: ...\nA: ..." — not a single run-on sentence.
 - "why": one sentence explaining why this improves AI citability
 
 Return a JSON object: {{"suggestions": [...]}}"""
