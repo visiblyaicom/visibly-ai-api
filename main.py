@@ -29,7 +29,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
-EMAIL_FROM = "hello@getvisiblyai.com"
+EMAIL_FROM = "hello@mail.getvisiblyai.com"
 
 # Map Stripe price IDs → plan (set these env vars in Railway after creating Stripe products)
 PRICE_TO_PLAN: dict[str, str] = {
