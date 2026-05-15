@@ -521,7 +521,11 @@ async def stripe_webhook(request: Request):
 
         license_key = _generate_key(plan)
         _insert_license(license_key, plan, email, customer_id, session_id)
-        _send_license_email(email, license_key, plan)
+        try:
+            _send_license_email(email, license_key, plan)
+        except Exception as email_err:
+            # Log but don't crash — license is saved, user sees key on success page
+            print(f"[email] Failed to send license email: {email_err}")
 
     return {"received": True}
 
