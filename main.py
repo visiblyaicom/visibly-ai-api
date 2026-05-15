@@ -142,7 +142,7 @@ def _lookup_license_by_session(session_id: str) -> tuple[str, str] | None:
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT key, plan FROM licenses WHERE stripe_session_id = %s", (session_id,))
-            return conn.cursor().fetchone() or cur.fetchone()
+            return cur.fetchone()
     finally:
         conn.close()
 
@@ -491,8 +491,11 @@ async def stripe_webhook(request: Request):
 
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+    except Exception as e:
+        # stripe.errors.SignatureVerificationError in SDK v8+; stripe.error.* in v7
+        if "SignatureVerification" in type(e).__name__ or "signature" in str(e).lower():
+            raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+        raise HTTPException(status_code=400, detail=f"Webhook error: {str(e)}")
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
