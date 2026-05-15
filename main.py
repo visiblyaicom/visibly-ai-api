@@ -497,14 +497,19 @@ async def stripe_webhook(request: Request):
             raise HTTPException(status_code=400, detail="Invalid Stripe signature")
         raise HTTPException(status_code=400, detail=f"Webhook error: {str(e)}")
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        session_id = session.get("id", "")
-        email = (session.get("customer_details") or {}).get("email") or session.get("customer_email", "")
-        customer_id = session.get("customer", "")
+    # Stripe SDK v8: use attribute access, not dict-style .get()
+    if event.type == "checkout.session.completed":
+        session = event.data.object
+        session_id = getattr(session, "id", "") or ""
+        customer_details = getattr(session, "customer_details", None)
+        email = (
+            getattr(customer_details, "email", None) if customer_details else None
+        ) or getattr(session, "customer_email", "") or ""
+        customer_id = getattr(session, "customer", "") or ""
 
         # Plan: metadata takes priority over price ID mapping
-        plan = (session.get("metadata") or {}).get("plan")
+        metadata = getattr(session, "metadata", None) or {}
+        plan = metadata.get("plan") if isinstance(metadata, dict) else getattr(metadata, "plan", None)
         if not plan and PRICE_TO_PLAN:
             try:
                 items = stripe.checkout.Session.list_line_items(session_id, limit=1)
