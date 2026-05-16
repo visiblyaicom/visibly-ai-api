@@ -8,7 +8,9 @@ import re
 import json
 import secrets
 import anthropic
-from datetime import datetime
+from datetime import datetime, timedelta
+import urllib.parse
+import time
 
 app = FastAPI(title="Visibly AI API", version="2.0.0")
 
@@ -30,6 +32,17 @@ STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 EMAIL_FROM = "hello@mail.getvisiblyai.com"
+
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+GSC_REDIRECT_URI = os.environ.get(
+    "GSC_REDIRECT_URI",
+    "https://web-production-8f080.up.railway.app/v1/gsc/callback",
+)
+GSC_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
+
+# In-memory OAuth state store: state_token -> (license_key, expires_at)
+_oauth_states: dict[str, tuple[str, float]] = {}
 
 # Map Stripe price IDs → plan (set these env vars in Railway after creating Stripe products)
 PRICE_TO_PLAN: dict[str, str] = {
@@ -79,6 +92,15 @@ def _init_db():
                     month TEXT NOT NULL,
                     count INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (license_key, month)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS gsc_tokens (
+                    license_key TEXT PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT NOT NULL,
+                    token_expiry TIMESTAMPTZ NOT NULL,
+                    connected_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
         conn.commit()
@@ -560,3 +582,362 @@ async def payment_success(session_id: str):
 
     # Webhook hasn't fired yet — show pending page with auto-refresh
     return HTMLResponse(_pending_html(session_id))
+
+
+# ---------------------------------------------------------------------------
+# GSC — DB helpers
+# ---------------------------------------------------------------------------
+
+def _save_gsc_tokens(license_key: str, access_token: str, refresh_token: str, expires_in: int):
+    conn = _get_db()
+    if not conn:
+        return
+    expiry = datetime.utcnow() + timedelta(seconds=max(0, expires_in - 60))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO gsc_tokens (license_key, access_token, refresh_token, token_expiry)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (license_key) DO UPDATE SET
+                       access_token = EXCLUDED.access_token,
+                       refresh_token = EXCLUDED.refresh_token,
+                       token_expiry = EXCLUDED.token_expiry""",
+                (license_key, access_token, refresh_token, expiry),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_gsc_tokens(license_key: str) -> dict | None:
+    conn = _get_db()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT access_token, refresh_token, token_expiry FROM gsc_tokens WHERE license_key = %s",
+                (license_key,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {"access_token": row[0], "refresh_token": row[1], "token_expiry": row[2]}
+    finally:
+        conn.close()
+
+
+def _delete_gsc_tokens(license_key: str):
+    conn = _get_db()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM gsc_tokens WHERE license_key = %s", (license_key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_valid_access_token(license_key: str) -> str | None:
+    """Returns a valid GSC access token, refreshing via refresh_token if expired."""
+    tokens = _get_gsc_tokens(license_key)
+    if not tokens:
+        return None
+
+    expiry = tokens["token_expiry"]
+    now_ts = time.time()
+    try:
+        import calendar
+        if hasattr(expiry, "utcoffset") and expiry.utcoffset() is not None:
+            expiry_ts = calendar.timegm(expiry.utctimetuple())
+        else:
+            expiry_ts = calendar.timegm(expiry.timetuple())
+        if now_ts < expiry_ts:
+            return tokens["access_token"]
+    except Exception:
+        pass
+
+    # Token expired — use refresh_token
+    try:
+        import httpx as _httpx
+        resp = _httpx.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": tokens["refresh_token"],
+                "grant_type": "refresh_token",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        new_access = data["access_token"]
+        expires_in = data.get("expires_in", 3600)
+        _save_gsc_tokens(license_key, new_access, tokens["refresh_token"], expires_in)
+        return new_access
+    except Exception as e:
+        print(f"[GSC] Token refresh failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# GSC — API helpers
+# ---------------------------------------------------------------------------
+
+def _find_matching_site(site_entries: list, page_url: str) -> str | None:
+    """Find the GSC property that contains this page URL."""
+    parsed = urllib.parse.urlparse(page_url)
+    domain = parsed.netloc
+    site_urls = [e.get("siteUrl", "") for e in site_entries]
+
+    # Exact domain-property match (sc-domain:)
+    for candidate in [f"sc-domain:{domain}", f"sc-domain:{domain.lstrip('www.')}"]:
+        if candidate in site_urls:
+            return candidate
+
+    # URL-prefix match — longest wins
+    prefix_matches = [s for s in site_urls if page_url.startswith(s)]
+    if prefix_matches:
+        return max(prefix_matches, key=len)
+
+    return None
+
+
+def _fetch_gsc_queries(access_token: str, page_url: str, days: int = 90) -> tuple[list[dict], str | None]:
+    """
+    Returns (rows, error_message). rows is a list of query dicts.
+    error_message is set when the site property isn't found.
+    """
+    import httpx as _httpx
+    from datetime import date
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days)
+
+    sites_resp = _httpx.get(
+        "https://www.googleapis.com/webmasters/v3/sites",
+        headers=headers,
+        timeout=10,
+    )
+    sites_resp.raise_for_status()
+    site_url = _find_matching_site(sites_resp.json().get("siteEntry", []), page_url)
+
+    if not site_url:
+        return [], "No matching GSC property found for this URL. Make sure your site is verified in Google Search Console."
+
+    body = {
+        "startDate": start_date.isoformat(),
+        "endDate": end_date.isoformat(),
+        "dimensions": ["query"],
+        "dimensionFilterGroups": [{
+            "filters": [{
+                "dimension": "page",
+                "operator": "equals",
+                "expression": page_url,
+            }]
+        }],
+        "rowLimit": 20,
+        "orderBy": [{"fieldName": "clicks", "sortOrder": "DESCENDING"}],
+    }
+
+    encoded_site = urllib.parse.quote(site_url, safe="")
+    analytics_resp = _httpx.post(
+        f"https://www.googleapis.com/webmasters/v3/sites/{encoded_site}/searchAnalytics/query",
+        headers=headers,
+        json=body,
+        timeout=15,
+    )
+    analytics_resp.raise_for_status()
+
+    rows = analytics_resp.json().get("rows", [])
+    queries = [
+        {
+            "query": row["keys"][0],
+            "clicks": int(row.get("clicks", 0)),
+            "impressions": int(row.get("impressions", 0)),
+            "ctr": round(row.get("ctr", 0) * 100, 1),
+            "position": round(row.get("position", 0), 1),
+        }
+        for row in rows
+    ]
+    return queries, None
+
+
+# ---------------------------------------------------------------------------
+# GSC — HTML helpers
+# ---------------------------------------------------------------------------
+
+def _gsc_success_html() -> str:
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GSC Connected — Visibly AI</title>{_PAGE_STYLE}
+<script>
+  if (window.opener) {{
+    window.opener.postMessage({{type:'visibly_gsc_connected'}}, '*');
+    setTimeout(function(){{ window.close(); }}, 1800);
+  }}
+</script>
+</head><body><div class="card">
+  <div class="logo">Visibly AI</div>
+  <h1><span class="check">✓</span> Google Search Console connected!</h1>
+  <p>Your GSC data will now appear in the Visibly AI sidebar when you edit posts.</p>
+  <p class="note">You can close this window and return to WordPress.</p>
+</div></body></html>"""
+
+
+def _gsc_error_html(message: str) -> str:
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connection Error — Visibly AI</title>{_PAGE_STYLE}</head>
+<body><div class="card">
+  <div class="logo">Visibly AI</div>
+  <h1 style="color:#dc2626">Connection failed</h1>
+  <p>{message}</p>
+  <p class="note">Please close this window and try again from your WordPress settings.</p>
+</div></body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# Routes — GSC
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/gsc/connect")
+def gsc_connect(license_key: str):
+    """Validates license then redirects to Google OAuth."""
+    from fastapi.responses import RedirectResponse
+
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="GSC OAuth not configured")
+
+    license_data = validate_license(license_key)
+    if not license_data:
+        raise HTTPException(status_code=401, detail="Invalid license key")
+
+    # Prune expired states
+    now = time.time()
+    for s in [k for k, v in _oauth_states.items() if v[1] < now]:
+        _oauth_states.pop(s, None)
+
+    state = secrets.token_urlsafe(32)
+    _oauth_states[state] = (license_key, now + 600)
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GSC_REDIRECT_URI,
+        "response_type": "code",
+        "scope": GSC_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+    return RedirectResponse(url=auth_url)
+
+
+@app.get("/v1/gsc/callback", response_class=HTMLResponse)
+def gsc_callback(code: str = None, state: str = None, error: str = None):
+    """Google OAuth callback — exchanges code for tokens and stores in DB."""
+    import httpx as _httpx
+
+    if error:
+        return HTMLResponse(_gsc_error_html(f"Authorization denied: {error}"))
+    if not code or not state:
+        return HTMLResponse(_gsc_error_html("Missing code or state parameter."))
+
+    state_entry = _oauth_states.pop(state, None)
+    if not state_entry:
+        return HTMLResponse(_gsc_error_html("Invalid or expired authorization state. Please try connecting again."))
+
+    license_key, expires_at = state_entry
+    if time.time() > expires_at:
+        return HTMLResponse(_gsc_error_html("Authorization expired. Please try connecting again."))
+
+    try:
+        resp = _httpx.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": GSC_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        token_data = resp.json()
+    except Exception as e:
+        return HTMLResponse(_gsc_error_html(f"Failed to exchange authorization code: {e}"))
+
+    access_token = token_data.get("access_token")
+    refresh_token = token_data.get("refresh_token")
+    expires_in = token_data.get("expires_in", 3600)
+
+    if not access_token or not refresh_token:
+        return HTMLResponse(_gsc_error_html("Google did not return the expected tokens. Please try again."))
+
+    _save_gsc_tokens(license_key, access_token, refresh_token, expires_in)
+    return HTMLResponse(_gsc_success_html())
+
+
+@app.get("/v1/gsc/status")
+def gsc_status(license_key: str):
+    """Returns whether GSC is connected for this license key."""
+    license_data = validate_license(license_key)
+    if not license_data:
+        raise HTTPException(status_code=401, detail="Invalid license key")
+
+    tokens = _get_gsc_tokens(license_key)
+    return {"connected": tokens is not None}
+
+
+@app.get("/v1/gsc/queries")
+def gsc_queries(license_key: str, url: str):
+    """Returns top GSC queries for the given page URL."""
+    import httpx as _httpx
+
+    license_data = validate_license(license_key)
+    if not license_data:
+        raise HTTPException(status_code=401, detail="Invalid license key")
+
+    access_token = _get_valid_access_token(license_key)
+    if not access_token:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "gsc_not_connected", "message": "GSC not connected. Please connect Google Search Console in your Pro & License settings."},
+        )
+
+    try:
+        queries, site_error = _fetch_gsc_queries(access_token, url)
+    except _httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            raise HTTPException(status_code=403, detail={"error": "gsc_auth_error", "message": "GSC permission denied. Please reconnect."})
+        raise HTTPException(status_code=502, detail=f"GSC API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch GSC data: {e}")
+
+    if site_error:
+        return {"connected": True, "queries": [], "near_page_1": [], "low_ctr": [], "query_strings": [], "site_error": site_error}
+
+    near_page_1 = [q for q in queries if 4.0 <= q["position"] <= 10.0]
+    low_ctr = [q for q in queries if q["position"] <= 10.0 and q["ctr"] < 3.0 and q["clicks"] > 0]
+
+    return {
+        "connected": True,
+        "queries": queries,
+        "near_page_1": near_page_1,
+        "low_ctr": low_ctr,
+        "query_strings": [q["query"] for q in queries[:10]],
+    }
+
+
+@app.delete("/v1/gsc/disconnect")
+def gsc_disconnect(license_key: str):
+    """Removes stored GSC tokens for this license key."""
+    license_data = validate_license(license_key)
+    if not license_data:
+        raise HTTPException(status_code=401, detail="Invalid license key")
+
+    _delete_gsc_tokens(license_key)
+    return {"disconnected": True}
