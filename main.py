@@ -697,8 +697,21 @@ def _find_matching_site(site_entries: list, page_url: str) -> str | None:
         if candidate in site_urls:
             return candidate
 
-    # URL-prefix match — longest wins
-    prefix_matches = [s for s in site_urls if page_url.startswith(s)]
+    # Build www/non-www variants of the page URL to handle mismatches
+    # e.g. WP permalink is non-www but GSC property is www (or vice versa)
+    url_variants = [page_url]
+    if domain.startswith("www."):
+        # also try without www
+        url_variants.append(page_url.replace(f"://{domain}", f"://{domain[4:]}", 1))
+    else:
+        # also try with www
+        url_variants.append(page_url.replace(f"://{domain}", f"://www.{domain}", 1))
+
+    # URL-prefix match — try all variants, longest wins
+    prefix_matches = [
+        s for s in site_urls
+        if any(variant.startswith(s) for variant in url_variants)
+    ]
     if prefix_matches:
         return max(prefix_matches, key=len)
 
