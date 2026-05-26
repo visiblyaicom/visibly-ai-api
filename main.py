@@ -933,7 +933,7 @@ def gsc_queries(license_key: str, url: str):
     if site_error:
         return {"connected": True, "queries": [], "near_page_1": [], "low_ctr": [], "query_strings": [], "site_error": site_error}
 
-    near_page_1 = [q for q in queries if 4.0 <= q["position"] <= 10.0]
+    near_page_1 = [q for q in queries if 11.0 <= q["position"] <= 20.0]
     low_ctr = [q for q in queries if q["position"] <= 10.0 and q["ctr"] < 3.0 and q["clicks"] > 0]
 
     return {
