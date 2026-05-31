@@ -741,6 +741,24 @@ def _fetch_gsc_queries(access_token: str, page_url: str, days: int = 90) -> tupl
     if not site_url:
         return [], "No matching GSC property found for this URL. Make sure your site is verified in Google Search Console."
 
+    # Normalize page_url www-style to match the matched site property.
+    # e.g. site_url = "https://www.adoreness.com/" but page_url = "https://adoreness.com/slug/"
+    # GSC indexes pages under the property's canonical www/non-www form.
+    normalized_url = page_url
+    if site_url.startswith("https://www.") or site_url.startswith("http://www."):
+        parsed_page = urllib.parse.urlparse(page_url)
+        if not parsed_page.netloc.startswith("www."):
+            normalized_url = page_url.replace(
+                f"://{parsed_page.netloc}", f"://www.{parsed_page.netloc}", 1
+            )
+    elif site_url.startswith("https://") or site_url.startswith("http://"):
+        # site is non-www — strip www from page_url if present
+        parsed_page = urllib.parse.urlparse(page_url)
+        if parsed_page.netloc.startswith("www."):
+            normalized_url = page_url.replace(
+                f"://www.{parsed_page.netloc[4:]}", f"://{parsed_page.netloc[4:]}", 1
+            )
+
     body = {
         "startDate": start_date.isoformat(),
         "endDate": end_date.isoformat(),
@@ -749,7 +767,7 @@ def _fetch_gsc_queries(access_token: str, page_url: str, days: int = 90) -> tupl
             "filters": [{
                 "dimension": "page",
                 "operator": "equals",
-                "expression": page_url,
+                "expression": normalized_url,
             }]
         }],
         "rowLimit": 20,
