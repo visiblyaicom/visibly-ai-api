@@ -299,6 +299,13 @@ class AnalyzeRequest(BaseModel):
     gsc_queries: Optional[list[str]] = None
 
 
+class GenerateSchemaRequest(BaseModel):
+    license_key: str
+    content: str
+    schema_type: str  # 'faq' | 'howto'
+    post_url: Optional[str] = None
+
+
 class LicenseValidateRequest(BaseModel):
     license_key: str
     site_url: Optional[str] = None
@@ -494,6 +501,80 @@ def analyze(req: AnalyzeRequest):
         raise HTTPException(status_code=500, detail=f"Failed to parse AI response: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI analysis failed: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Routes — generate schema
+# ---------------------------------------------------------------------------
+
+GENERATE_FAQ_PROMPT = """You are an expert in structured data and Answer Engine Optimization (AEO).
+
+Given a WordPress post, generate 4–6 high-quality FAQ pairs that:
+- Answer real questions readers of this post would ask
+- Use the post's own content and language (don't invent facts)
+- Have concise answers of 2–4 sentences — ideal for Google AI Overviews and Perplexity
+- Cover a range of question types: what/why/how/when
+
+Return ONLY valid JSON in this exact format with no other text:
+{"faq": [{"question": "...", "answer": "..."}, ...]}"""
+
+GENERATE_HOWTO_PROMPT = """You are an expert in structured data and Answer Engine Optimization (AEO).
+
+Given a WordPress post, generate a HowTo schema object that:
+- Extracts the actual steps described in the post (do not invent steps)
+- Uses a clear "How to..." title
+- Has 3–8 steps, each with a short action name and 1–3 sentence instructions
+- Writes a brief description summarising what the reader will achieve
+
+Return ONLY valid JSON in this exact format with no other text:
+{"howto_name": "How to ...", "howto_desc": "...", "steps": [{"name": "...", "text": "..."}, ...]}"""
+
+
+@app.post("/v1/generate-schema")
+def generate_schema(req: GenerateSchemaRequest):
+    license_data = validate_license(req.license_key)
+    if not license_data:
+        raise HTTPException(status_code=401, detail="Invalid license key")
+
+    plan = license_data.get("plan", "pro")
+    used, limit = check_usage_limit(req.license_key, plan)
+
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not anthropic_key:
+        raise HTTPException(status_code=500, detail="AI service not configured")
+
+    if req.schema_type not in ("faq", "howto"):
+        raise HTTPException(status_code=400, detail="schema_type must be 'faq' or 'howto'")
+
+    system_prompt = GENERATE_FAQ_PROMPT if req.schema_type == "faq" else GENERATE_HOWTO_PROMPT
+    clean_content = strip_block_comments(req.content)
+    url_line = f"\nPost URL: {req.post_url}" if req.post_url else ""
+    user_prompt = f"Generate schema markup for this post.{url_line}\n\nPost content:\n{clean_content[:8000]}"
+
+    try:
+        client = anthropic.Anthropic(api_key=anthropic_key)
+        message = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        response_text = message.content[0].text
+
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+
+        result = json.loads(response_text)
+        new_count = increment_usage(req.license_key)
+        result["usage"] = {"used": new_count, "limit": limit}
+        return result
+
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse AI response: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Schema generation failed: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
