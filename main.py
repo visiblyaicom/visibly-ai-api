@@ -480,7 +480,7 @@ def analyze(req: AnalyzeRequest):
     try:
         client = anthropic.Anthropic(api_key=anthropic_key)
         message = client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-sonnet-5-5",
             max_tokens=2048,
             system=ANALYZE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
@@ -554,7 +554,7 @@ def generate_schema(req: GenerateSchemaRequest):
     try:
         client = anthropic.Anthropic(api_key=anthropic_key)
         message = client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-sonnet-5-5",
             max_tokens=1024,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
