@@ -485,7 +485,10 @@ def analyze(req: AnalyzeRequest):
             system=ANALYZE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
-        response_text = message.content[0].text
+        # Claude 5 returns a thinking block before the text block
+        response_text = "".join(
+            b.text for b in message.content if getattr(b, "type", None) == "text"
+        )
 
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0].strip()
@@ -559,7 +562,10 @@ def generate_schema(req: GenerateSchemaRequest):
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        response_text = message.content[0].text
+        # Claude 5 returns a thinking block before the text block
+        response_text = "".join(
+            b.text for b in message.content if getattr(b, "type", None) == "text"
+        )
 
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0].strip()
