@@ -483,6 +483,9 @@ def health():
         "status": "ok",
         "service": "Visibly AI API",
         "commit": (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "unknown")[:7],
+        # Whether the welcome sequence can legally send yet. A boolean, never the
+        # address itself: this endpoint is public and the value is a postal address.
+        "mailing_address_set": bool(MAILING_ADDRESS),
     }
 
 
