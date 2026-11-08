@@ -11,6 +11,7 @@ import anthropic
 from datetime import datetime, timedelta
 import urllib.parse
 import time
+import asyncio
 
 app = FastAPI(title="Visibly AI API", version="2.0.0")
 
@@ -129,9 +130,34 @@ def _init_db():
         conn.close()
 
 
+SEQUENCE_INTERVAL_SECONDS = int(os.environ.get("SEQUENCE_INTERVAL_SECONDS", 3600))
+
+
+async def _sequence_loop():
+    """Runs the welcome sequence on a timer so no external cron is needed.
+
+    Hourly rather than daily: a signup whose inline send failed should not wait a
+    day for its welcome, and the day 3 / day 7 steps land closer to the mark. The
+    pass is idempotent and advisory-locked, so extra runs cost nothing.
+    """
+    while True:
+        try:
+            await asyncio.sleep(SEQUENCE_INTERVAL_SECONDS)
+            await asyncio.to_thread(_run_sequence_pass)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Never let one bad pass kill the loop for the life of the process.
+            pass
+
+
+# Async on purpose. Starlette runs a sync startup handler directly, but
+# asyncio.get_event_loop() is deprecated inside a running loop and its behaviour
+# differs across versions; an async handler with create_task is unambiguous.
 @app.on_event("startup")
-def startup():
+async def startup():
     _init_db()
+    app.state.sequence_task = asyncio.create_task(_sequence_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -1315,53 +1341,73 @@ def unsubscribe(token: str = ""):
 </body></html>""")
 
 
+# Arbitrary fixed key for the Postgres advisory lock that keeps two workers from
+# running a pass at the same time and double-sending.
+_SEQUENCE_LOCK_KEY = 8417203
+
+
+def _run_sequence_pass() -> dict:
+    """Sends any sequence emails that are due. Safe to call repeatedly."""
+    conn = _get_db()
+    if not conn:
+        return {"status": "skipped", "reason": "no database", "sent": 0, "failed": 0}
+
+    sent, failed = 0, 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (_SEQUENCE_LOCK_KEY,))
+            if not cur.fetchone()[0]:
+                return {"status": "skipped", "reason": "another pass is running",
+                        "sent": 0, "failed": 0}
+        try:
+            # Step 1 is attempted inline at signup, but it is included here as the
+            # catch-up path: anyone left on step 0 because a send failed (no Resend
+            # key, no MAILING_ADDRESS, a transient Resend error) is picked up here.
+            for step, (wait_days, _, _) in sorted(SEQUENCE.items()):
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT email, token FROM subscribers
+                        WHERE unsubscribed_at IS NULL
+                          AND sequence_step = %s
+                          AND created_at <= NOW() - (%s * INTERVAL '1 day')
+                        LIMIT 200
+                        """,
+                        (step - 1, wait_days),
+                    )
+                    due = cur.fetchall()
+
+                for email, token in due:
+                    if _send_sequence_email(email, token, step):
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE subscribers SET sequence_step = %s, "
+                                "last_sent_at = NOW() WHERE email = %s",
+                                (step, email),
+                            )
+                        conn.commit()
+                        sent += 1
+                    else:
+                        failed += 1
+        finally:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (_SEQUENCE_LOCK_KEY,))
+            conn.commit()
+    finally:
+        conn.close()
+
+    return {"status": "ok", "sent": sent, "failed": failed}
+
+
 @app.post("/v1/cron/send-sequence")
 def send_sequence(request: Request):
-    """Advances the welcome sequence. Call once a day from a scheduler.
+    """Manual or external trigger for the sequence.
 
-    Fails closed: with no CRON_SECRET set, this refuses rather than running open.
+    The app runs this on its own schedule too (see _sequence_loop), so this endpoint
+    is a convenience, not a requirement. Fails closed without CRON_SECRET.
     """
     if not CRON_SECRET:
         raise HTTPException(status_code=503, detail="CRON_SECRET is not configured.")
     if request.headers.get("x-cron-secret") != CRON_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized.")
-
-    conn = _get_db()
-    if not conn:
-        raise HTTPException(status_code=503, detail="No database.")
-
-    sent, failed = 0, 0
-    try:
-        # Step 1 is attempted inline at signup, but it is included here as the catch-up
-        # path: anyone left on step 0 because a send failed (no Resend key, no
-        # MAILING_ADDRESS, a transient Resend error) is picked up on the next run.
-        for step, (wait_days, _, _) in sorted(SEQUENCE.items()):
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT email, token FROM subscribers
-                    WHERE unsubscribed_at IS NULL
-                      AND sequence_step = %s
-                      AND created_at <= NOW() - (%s * INTERVAL '1 day')
-                    LIMIT 200
-                    """,
-                    (step - 1, wait_days),
-                )
-                due = cur.fetchall()
-
-            for email, token in due:
-                if _send_sequence_email(email, token, step):
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE subscribers SET sequence_step = %s, last_sent_at = NOW() "
-                            "WHERE email = %s",
-                            (step, email),
-                        )
-                    conn.commit()
-                    sent += 1
-                else:
-                    failed += 1
-    finally:
-        conn.close()
-
-    return {"status": "ok", "sent": sent, "failed": failed}
+    return _run_sequence_pass()
