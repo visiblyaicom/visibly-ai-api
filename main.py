@@ -475,7 +475,15 @@ def _pending_html(session_id: str) -> str:
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "Visibly AI API", "version": "2.0.0"}
+    # Reports the deployed commit, not a hardcoded version string. Railway's
+    # x-hikari-trace header alternates between edge nodes and is NOT a deployment
+    # identifier, so before this there was no way to tell whether a push had
+    # actually gone live.
+    return {
+        "status": "ok",
+        "service": "Visibly AI API",
+        "commit": (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "unknown")[:7],
+    }
 
 
 @app.post("/v1/license/validate")
