@@ -33,6 +33,16 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 EMAIL_FROM = "hello@mail.getvisiblyai.com"
 
+API_BASE_URL = os.environ.get(
+    "API_BASE_URL", "https://web-production-8f080.up.railway.app"
+)
+# Shared secret for /v1/cron/send-sequence. Without it the endpoint refuses to run,
+# so a missing env var fails closed rather than exposing a public mailer.
+CRON_SECRET = os.environ.get("CRON_SECRET")
+# CAN-SPAM requires a physical postal address in commercial email. Set this in Railway
+# before the welcome sequence goes anywhere real; emails say so until it is set.
+MAILING_ADDRESS = os.environ.get("MAILING_ADDRESS", "")
+
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 GSC_REDIRECT_URI = os.environ.get(
@@ -101,6 +111,17 @@ def _init_db():
                     refresh_token TEXT NOT NULL,
                     token_expiry TIMESTAMPTZ NOT NULL,
                     connected_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscribers (
+                    email TEXT PRIMARY KEY,
+                    token TEXT NOT NULL UNIQUE,
+                    source TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    unsubscribed_at TIMESTAMPTZ,
+                    sequence_step INTEGER NOT NULL DEFAULT 0,
+                    last_sent_at TIMESTAMPTZ
                 )
             """)
         conn.commit()
@@ -1059,3 +1080,288 @@ def gsc_disconnect(license_key: str):
 
     _delete_gsc_tokens(license_key)
     return {"disconnected": True}
+
+
+# ---------------------------------------------------------------------------
+# Newsletter: capture, welcome sequence, unsubscribe
+#
+# WP.org exposes no way to contact an installer, so this list is the only owned
+# channel Visibly AI has. It runs on infrastructure that already exists: the same
+# Postgres and the same Resend sending domain used for license delivery.
+# ---------------------------------------------------------------------------
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+\.[^@\s]{2,}$")
+
+# Per-IP throttle. An open subscribe endpoint gets scraped and abused, and this
+# keeps a single source from stuffing the list. In-memory on purpose: the same
+# approach the OAuth state store uses, and a restart losing it is harmless.
+_subscribe_hits: dict[str, list[float]] = {}
+SUBSCRIBE_MAX_PER_HOUR = 5
+
+
+def _throttled(ip: str) -> bool:
+    now = time.time()
+    hits = [t for t in _subscribe_hits.get(ip, []) if now - t < 3600]
+    _subscribe_hits[ip] = hits
+    if len(hits) >= SUBSCRIBE_MAX_PER_HOUR:
+        return True
+    hits.append(now)
+    return False
+
+
+def _email_footer(token: str) -> str:
+    """Unsubscribe is legally required in every one of these, not optional."""
+    addr = (
+        f'<p style="margin:8px 0 0">{MAILING_ADDRESS}</p>'
+        if MAILING_ADDRESS
+        else '<p style="margin:8px 0 0;color:#b91c1c">[MAILING_ADDRESS env var is not '
+             'set. CAN-SPAM requires a postal address here.]</p>'
+    )
+    return f"""
+  <hr style="border:none;border-top:1px solid #e5e7eb;margin:32px 0 16px">
+  <div style="color:#9ca3af;font-size:12px;line-height:1.6">
+    <p style="margin:0">You are getting this because you signed up at getvisiblyai.com.</p>
+    <p style="margin:4px 0 0"><a href="{API_BASE_URL}/v1/unsubscribe?token={token}"
+      style="color:#9ca3af">Unsubscribe</a></p>
+    {addr}
+  </div>
+"""
+
+
+def _wrap_email(body_html: str, token: str) -> str:
+    return (
+        '<div style="font-family:sans-serif;max-width:540px;margin:0 auto;'
+        'padding:32px 24px;color:#1f2937">' + body_html + _email_footer(token) + "</div>"
+    )
+
+
+# step -> (days to wait after signup, subject, body html)
+SEQUENCE: dict[int, tuple[int, str, str]] = {
+    1: (
+        0,
+        "Check your FAQ schema is actually on the page",
+        """
+  <h2 style="color:#7c3aed;margin:0 0 8px">Thanks for signing up</h2>
+  <p style="margin:0 0 20px;color:#374151">One thing worth doing before anything else,
+  and it takes 20 seconds.</p>
+  <p style="margin:0 0 12px;color:#374151">If you have built FAQ schema with any WordPress
+  plugin, open the published post (not the editor preview), view source, and search for
+  <code>FAQPage</code>.</p>
+  <p style="margin:0 0 20px;color:#374151">If it is not there, the markup is not there,
+  whatever the plugin's panel told you. A scorer and a renderer are different pieces of
+  code and nothing guarantees they agree. I know, because mine disagreed for five months.</p>
+  <p style="margin:0 0 8px;color:#374151">Worth checking your top 5 posts.</p>
+""",
+    ),
+    2: (
+        3,
+        "The AEO signal most people skip",
+        """
+  <h2 style="color:#7c3aed;margin:0 0 8px">The short direct answer</h2>
+  <p style="margin:0 0 20px;color:#374151">Of the signals that decide whether an AI engine
+  cites you, this is the one most content misses.</p>
+  <p style="margin:0 0 12px;color:#374151">Put a 40 to 60 word answer directly under each
+  question heading, and make the first sentence answer the question outright. No preamble,
+  no "in this article we will look at".</p>
+  <p style="margin:0 0 20px;color:#374151">That paragraph is what gets pulled into an
+  answer. If your heading asks a question and the next paragraph sets up context instead
+  of answering it, there is nothing for the engine to quote.</p>
+  <p style="margin:0 0 8px;color:#374151">Question-format headings plus a short direct
+  answer underneath does more for citation than anything else on the list.</p>
+""",
+    ),
+    3: (
+        7,
+        "What Pro actually does",
+        """
+  <h2 style="color:#7c3aed;margin:0 0 8px">Only if it is useful to you</h2>
+  <p style="margin:0 0 16px;color:#374151">The free plugin scores your content against the
+  signals and tells you which ones fail. That is genuinely the useful half, and plenty of
+  people never need more.</p>
+  <p style="margin:0 0 16px;color:#374151">Pro adds two things: Claude reads the post and
+  returns specific copy-pasteable fixes for the signals you are failing, and a Google
+  Search Console connection makes those suggestions follow your actual search queries
+  rather than generic advice.</p>
+  <p style="margin:0 0 20px;color:#374151">$19/mo or $149/yr, one site.
+  <a href="https://www.getvisiblyai.com" style="color:#7c3aed">getvisiblyai.com</a></p>
+  <p style="margin:0 0 8px;color:#6b7280;font-size:14px">That is the last thing I will send
+  about Pro. Reply any time if something is broken, it comes straight to me.</p>
+""",
+    ),
+}
+
+
+def _send_sequence_email(email: str, token: str, step: int) -> bool:
+    if not RESEND_API_KEY or step not in SEQUENCE:
+        return False
+    # Refuse to send commercial email without the postal address CAN-SPAM requires.
+    # Returning False leaves sequence_step where it was, so the subscriber is kept and
+    # the next cron run delivers it once MAILING_ADDRESS is configured. Better a late
+    # welcome than a non-compliant one.
+    if not MAILING_ADDRESS:
+        return False
+    import resend
+    resend.api_key = RESEND_API_KEY
+    _, subject, body = SEQUENCE[step]
+    try:
+        resend.Emails.send({
+            "from": f"Visibly AI <{EMAIL_FROM}>",
+            "to": [email],
+            "subject": subject,
+            "html": _wrap_email(body, token),
+        })
+        return True
+    except Exception:
+        # A send failure must not fail the signup, and must not advance the step,
+        # so the next cron run retries this subscriber.
+        return False
+
+
+class SubscribeRequest(BaseModel):
+    email: str
+    source: Optional[str] = None
+    # Honeypot. A real person leaves it empty; most bots fill every field.
+    company: Optional[str] = None
+
+
+@app.post("/v1/subscribe")
+def subscribe(req: SubscribeRequest, request: Request):
+    # Always the same response shape, so the endpoint cannot be used to find out
+    # whether an address is already on the list.
+    ok = {"status": "ok"}
+
+    if req.company:
+        return ok
+
+    email = (req.email or "").strip().lower()
+    if not EMAIL_RE.match(email) or len(email) > 254:
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+
+    ip = request.client.host if request.client else "unknown"
+    if _throttled(ip):
+        raise HTTPException(status_code=429, detail="Too many signups. Try again later.")
+
+    token = secrets.token_urlsafe(24)
+    source = (req.source or "")[:64] or None
+
+    conn = _get_db()
+    if not conn:
+        raise HTTPException(status_code=503, detail="Signup is unavailable right now.")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO subscribers (email, token, source, sequence_step)
+                VALUES (%s, %s, %s, 0)
+                ON CONFLICT (email) DO NOTHING
+                RETURNING token
+                """,
+                (email, token, source),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+
+    # No row means the address was already subscribed. Say nothing and send nothing:
+    # re-signing up should not re-trigger the sequence.
+    if not row:
+        return ok
+
+    if _send_sequence_email(email, row[0], 1):
+        conn = _get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE subscribers SET sequence_step = 1, last_sent_at = NOW() "
+                    "WHERE email = %s",
+                    (email,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    return ok
+
+
+@app.get("/v1/unsubscribe", response_class=HTMLResponse)
+def unsubscribe(token: str = ""):
+    message = "That link is not valid. Nothing was changed."
+    if token:
+        conn = _get_db()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE subscribers SET unsubscribed_at = NOW() "
+                        "WHERE token = %s AND unsubscribed_at IS NULL RETURNING email",
+                        (token,),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            finally:
+                conn.close()
+            # Already-unsubscribed gets the same wording: the user's intent is served
+            # either way and there is no reason to expose which case it was.
+            message = "You are unsubscribed. You will not get any more of these."
+    return HTMLResponse(f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Visibly AI</title></head>
+<body style="font-family:sans-serif;max-width:480px;margin:80px auto;padding:0 24px;color:#1f2937">
+  <h1 style="color:#7c3aed;font-size:20px">Visibly AI</h1>
+  <p style="color:#374151">{message}</p>
+  <p><a href="https://www.getvisiblyai.com" style="color:#7c3aed">getvisiblyai.com</a></p>
+</body></html>""")
+
+
+@app.post("/v1/cron/send-sequence")
+def send_sequence(request: Request):
+    """Advances the welcome sequence. Call once a day from a scheduler.
+
+    Fails closed: with no CRON_SECRET set, this refuses rather than running open.
+    """
+    if not CRON_SECRET:
+        raise HTTPException(status_code=503, detail="CRON_SECRET is not configured.")
+    if request.headers.get("x-cron-secret") != CRON_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+
+    conn = _get_db()
+    if not conn:
+        raise HTTPException(status_code=503, detail="No database.")
+
+    sent, failed = 0, 0
+    try:
+        # Step 1 is attempted inline at signup, but it is included here as the catch-up
+        # path: anyone left on step 0 because a send failed (no Resend key, no
+        # MAILING_ADDRESS, a transient Resend error) is picked up on the next run.
+        for step, (wait_days, _, _) in sorted(SEQUENCE.items()):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT email, token FROM subscribers
+                    WHERE unsubscribed_at IS NULL
+                      AND sequence_step = %s
+                      AND created_at <= NOW() - (%s * INTERVAL '1 day')
+                    LIMIT 200
+                    """,
+                    (step - 1, wait_days),
+                )
+                due = cur.fetchall()
+
+            for email, token in due:
+                if _send_sequence_email(email, token, step):
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE subscribers SET sequence_step = %s, last_sent_at = NOW() "
+                            "WHERE email = %s",
+                            (step, email),
+                        )
+                    conn.commit()
+                    sent += 1
+                else:
+                    failed += 1
+    finally:
+        conn.close()
+
+    return {"status": "ok", "sent": sent, "failed": failed}
