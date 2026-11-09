@@ -1176,6 +1176,20 @@ def _wrap_email(body_html: str, token: str) -> str:
 SEQUENCE: dict[int, tuple[int, str, str]] = {
     1: (
         0,
+        "Thanks for signing up. Start with these three posts",
+        """
+  <h2 style="color:#7c3aed;margin:0 0 8px">Thanks for opting in</h2>
+  <p style="margin:0 0 16px;color:#374151">Here are the three posts people read most, to
+  start with:</p>
+  <p style="margin:0 0 10px;color:#374151"><a href="https://www.getvisiblyai.com/blog/what-is-aeo" style="color:#7c3aed">What is AEO? Answer Engine Optimization for WordPress Bloggers</a></p>
+  <p style="margin:0 0 10px;color:#374151"><a href="https://www.getvisiblyai.com/blog/10-signals-ai-citation" style="color:#7c3aed">10 Signals That Determine If AI Cites Your Content</a></p>
+  <p style="margin:0 0 20px;color:#374151"><a href="https://www.getvisiblyai.com/blog/how-to-add-faq-schema-wordpress" style="color:#7c3aed">How to Add FAQ Schema to WordPress (For SEO and AI Search)</a></p>
+  <p style="margin:0 0 8px;color:#6b7280;font-size:14px">I'll send a few short tips over the next
+  couple of weeks. Unsubscribe any time with the link below.</p>
+""",
+    ),
+    2: (
+        3,
         "Check your FAQ schema is actually on the page",
         """
   <h2 style="color:#7c3aed;margin:0 0 8px">Thanks for signing up</h2>
@@ -1190,8 +1204,8 @@ SEQUENCE: dict[int, tuple[int, str, str]] = {
   <p style="margin:0 0 8px;color:#374151">Worth checking your top 5 posts.</p>
 """,
     ),
-    2: (
-        3,
+    3: (
+        7,
         "The AEO signal most people skip",
         """
   <h2 style="color:#7c3aed;margin:0 0 8px">The short direct answer</h2>
@@ -1207,8 +1221,8 @@ SEQUENCE: dict[int, tuple[int, str, str]] = {
   answer underneath does more for citation than anything else on the list.</p>
 """,
     ),
-    3: (
-        7,
+    4: (
+        10,
         "What Pro actually does",
         """
   <h2 style="color:#7c3aed;margin:0 0 8px">Only if it is useful to you</h2>
